@@ -1,0 +1,1139 @@
+library animated_containers;
+
+import 'package:flutter/material.dart';
+
+// mostly copied from flutter's Wrap widget
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/rendering.dart';
+import 'util.dart';
+
+(double leadingSpace, double betweenSpace) distributeWrapSpace(
+    WrapAlignment alignment,
+    double freeSpace,
+    double itemSpacing,
+    int itemCount) {
+  assert(itemCount > 0);
+  return switch (alignment) {
+    WrapAlignment.start => (0.0, itemSpacing),
+    WrapAlignment.end => (freeSpace, itemSpacing),
+    WrapAlignment.spaceBetween when itemCount < 2 => distributeWrapSpace(
+        WrapAlignment.start, freeSpace, itemSpacing, itemCount),
+    WrapAlignment.spaceBetween => (
+        0,
+        freeSpace / (itemCount - 1) + itemSpacing
+      ),
+    WrapAlignment.center => (freeSpace / 2.0, itemSpacing),
+    WrapAlignment.spaceAround => (
+        freeSpace / itemCount / 2,
+        freeSpace / itemCount + itemSpacing
+      ),
+    WrapAlignment.spaceEvenly => (
+        freeSpace / (itemCount + 1),
+        freeSpace / (itemCount + 1) + itemSpacing
+      ),
+  };
+}
+
+class _RunMetrics {
+  AxisSize axisSize = AxisSize.empty;
+  int childCount = 0;
+  RenderBox? leadingChild;
+}
+
+/// Parent data for use with [InsertableWrapRender].
+class InsertableWrapParentData extends ContainerBoxParentData<RenderBox> {}
+
+/// a position at which a child can be inserted
+class InsertionPoint {
+  /// the index of the item being most closely hovered
+  final int index;
+
+  /// relative to the wrap (note, you use a global position to get the insertionPoint, they're different coordinate systems)
+  final Offset position;
+
+  /// whether it's inserting after element at `index` (otherwise, it's inserting before it)
+  final bool insertingAfter;
+
+  /// is wide when it's not inserting at a between point, in which case a narrow selector visual wouldn't look right
+  final bool inserterWide;
+  const InsertionPoint({
+    required this.index,
+    required this.insertingAfter,
+    required this.position,
+    this.inserterWide = false,
+  });
+
+  /// if you just want to insert between the nearest two elements, this is the index you want to insert into the array at. If you're moving something that is itself already in the list, we recommend that you use the below method instead
+  int midwayInsertionIndex() => index + (insertingAfter ? 1 : 0);
+
+  /// this will behave more in line with user intent, if a user drags an item to its neighbor, this will always place it beyond its neighbor, while midwayInsertionIndex will sometimes place it back where it was to begin with and produce no action. Returns false if it's still going to have no effect anyway (eg if there's no room for a movement).
+  (bool, int) cleverInsertionIndexFor(int currentIndex, int listLength) {
+    // if it's moving to before or after the current index, that would be a no op
+    if (index != currentIndex) {
+      int insertingAt;
+      // if the item being pointed at is either of those directly adjacent to the current index, the especially prefer to place it before or after those on the other side, not on the same side (which would be a no-op)
+      if (index == currentIndex + 1) {
+        insertingAt = currentIndex + 2; // after itself, after the next one.
+      } else if (index == currentIndex - 1) {
+        insertingAt = currentIndex - 1;
+      } else {
+        insertingAt = midwayInsertionIndex();
+      }
+      // make sure it hasn't been nudged out of all valid insertion points, if so, then there is no valid insertion point other than the original location, so no movement
+      return (insertingAt <= listLength && insertingAt >= 0, insertingAt);
+    } else {
+      return (false, midwayInsertionIndex());
+    }
+  }
+}
+
+/// Displays its children in multiple horizontal or vertical runs.
+///
+/// A [InsertableWrapRender] lays out each child and attempts to place the child adjacent
+/// to the previous child in the main axis, given by [direction], leaving
+/// [spacing] space in between. If there is not enough space to fit the child,
+/// [InsertableWrapRender] creates a new _run_ adjacent to the existing children in the
+/// cross axis.
+///
+/// After all the children have been allocated to runs, the children within the
+/// runs are positioned according to the [alignment] in the main axis and
+/// according to the [crossAxisAlignment] in the cross axis.
+///
+/// The runs themselves are then positioned in the cross axis according to the
+/// [runSpacing] and [runAlignment].
+///
+class InsertableWrapRender extends RenderBox
+    with
+        ContainerRenderObjectMixin<RenderBox, InsertableWrapParentData>,
+        RenderBoxContainerDefaultsMixin<RenderBox, InsertableWrapParentData> {
+  /// Creates a wrap render object.
+  ///
+  /// By default, the wrap layout is horizontal and both the children and the
+  /// runs are aligned to the start.
+  InsertableWrapRender({
+    List<RenderBox>? children,
+    Axis direction = Axis.horizontal,
+    WrapAlignment alignment = WrapAlignment.start,
+    double spacing = 0.0,
+    WrapAlignment runAlignment = WrapAlignment.start,
+    double runSpacing = 0.0,
+    WrapCrossAlignment crossAxisAlignment = WrapCrossAlignment.start,
+    TextDirection? textDirection,
+    VerticalDirection verticalDirection = VerticalDirection.down,
+    Clip clipBehavior = Clip.none,
+  })  : _direction = direction,
+        _alignment = alignment,
+        _spacing = spacing,
+        _runAlignment = runAlignment,
+        _runSpacing = runSpacing,
+        _crossAxisAlignment = crossAxisAlignment,
+        _textDirection = textDirection,
+        _verticalDirection = verticalDirection,
+        _clipBehavior = clipBehavior {
+    addAll(children);
+  }
+
+  /// The direction to use as the main axis.
+  ///
+  /// For example, if [direction] is [Axis.horizontal], the default, the
+  /// children are placed adjacent to one another in a horizontal run until the
+  /// available horizontal space is consumed, at which point a subsequent
+  /// children are placed in a new run vertically adjacent to the previous run.
+  Axis get direction => _direction;
+  Axis _direction;
+  set direction(Axis value) {
+    if (_direction == value) {
+      return;
+    }
+    _direction = value;
+  }
+
+  /// How the children within a run should be placed in the main axis.
+  ///
+  /// For example, if [alignment] is [WrapAlignment.center], the children in
+  /// each run are grouped together in the center of their run in the main axis.
+  ///
+  /// Defaults to [WrapAlignment.start].
+  ///
+  /// See also:
+  ///
+  ///  * [runAlignment], which controls how the runs are placed relative to each
+  ///    other in the cross axis.
+  ///  * [crossAxisAlignment], which controls how the children within each run
+  ///    are placed relative to each other in the cross axis.
+  WrapAlignment get alignment => _alignment;
+  WrapAlignment _alignment;
+  set alignment(WrapAlignment value) {
+    if (_alignment == value) {
+      return;
+    }
+    _alignment = value;
+    markNeedsLayout();
+  }
+
+  /// How much space to place between children in a run in the main axis.
+  ///
+  /// For example, if [spacing] is 10.0, the children will be spaced at least
+  /// 10.0 logical pixels apart in the main axis.
+  ///
+  /// If there is additional free space in a run (e.g., because the wrap has a
+  /// minimum size that is not filled or because some runs are longer than
+  /// others), the additional free space will be allocated according to the
+  /// [alignment].
+  ///
+  /// Defaults to 0.0.
+  double get spacing => _spacing;
+  double _spacing;
+  set spacing(double value) {
+    if (_spacing == value) {
+      return;
+    }
+    _spacing = value;
+    markNeedsLayout();
+  }
+
+  /// How the runs themselves should be placed in the cross axis.
+  ///
+  /// For example, if [runAlignment] is [WrapAlignment.center], the runs are
+  /// grouped together in the center of the overall [RenderWrap] in the cross
+  /// axis.
+  ///
+  /// Defaults to [WrapAlignment.start].
+  ///
+  /// See also:
+  ///
+  ///  * [alignment], which controls how the children within each run are placed
+  ///    relative to each other in the main axis.
+  ///  * [crossAxisAlignment], which controls how the children within each run
+  ///    are placed relative to each other in the cross axis.
+  WrapAlignment get runAlignment => _runAlignment;
+  WrapAlignment _runAlignment;
+  set runAlignment(WrapAlignment value) {
+    if (_runAlignment == value) {
+      return;
+    }
+    _runAlignment = value;
+    markNeedsLayout();
+  }
+
+  /// How much space to place between the runs themselves in the cross axis.
+  ///
+  /// For example, if [runSpacing] is 10.0, the runs will be spaced at least
+  /// 10.0 logical pixels apart in the cross axis.
+  ///
+  /// If there is additional free space in the overall [RenderWrap] (e.g.,
+  /// because the wrap has a minimum size that is not filled), the additional
+  /// free space will be allocated according to the [runAlignment].
+  ///
+  /// Defaults to 0.0.
+  double get runSpacing => _runSpacing;
+  double _runSpacing;
+  set runSpacing(double value) {
+    if (_runSpacing == value) {
+      return;
+    }
+    _runSpacing = value;
+    markNeedsLayout();
+  }
+
+  /// How the children within a run should be aligned relative to each other in
+  /// the cross axis.
+  ///
+  /// For example, if this is set to [WrapCrossAlignment.end], and the
+  /// [direction] is [Axis.horizontal], then the children within each
+  /// run will have their bottom edges aligned to the bottom edge of the run.
+  ///
+  /// Defaults to [WrapCrossAlignment.start].
+  ///
+  /// See also:
+  ///
+  ///  * [alignment], which controls how the children within each run are placed
+  ///    relative to each other in the main axis.
+  ///  * [runAlignment], which controls how the runs are placed relative to each
+  ///    other in the cross axis.
+  WrapCrossAlignment get crossAxisAlignment => _crossAxisAlignment;
+  WrapCrossAlignment _crossAxisAlignment;
+  set crossAxisAlignment(WrapCrossAlignment value) {
+    if (_crossAxisAlignment == value) {
+      return;
+    }
+    _crossAxisAlignment = value;
+    markNeedsLayout();
+  }
+
+  /// Determines the order to lay children out horizontally and how to interpret
+  /// `start` and `end` in the horizontal direction. Not actually about text. Is merely analagous to the way text is laid out in paragraphs.
+  ///
+  /// If the [direction] is [Axis.horizontal], this controls the order in which
+  /// children are positioned (left-to-right or right-to-left), and the meaning
+  /// of the [alignment] property's [WrapAlignment.start] and
+  /// [WrapAlignment.end] values.
+  ///
+  /// If the [direction] is [Axis.horizontal], and either the
+  /// [alignment] is either [WrapAlignment.start] or [WrapAlignment.end], or
+  /// there's more than one child, then the [textDirection] must not be null.
+  ///
+  /// If the [direction] is [Axis.vertical], this controls the order in
+  /// which runs are positioned, the meaning of the [runAlignment] property's
+  /// [WrapAlignment.start] and [WrapAlignment.end] values, as well as the
+  /// [crossAxisAlignment] property's [WrapCrossAlignment.start] and
+  /// [WrapCrossAlignment.end] values.
+  ///
+  /// If the [direction] is [Axis.vertical], and either the
+  /// [runAlignment] is either [WrapAlignment.start] or [WrapAlignment.end], the
+  /// [crossAxisAlignment] is either [WrapCrossAlignment.start] or
+  /// [WrapCrossAlignment.end], or there's more than one child, then the
+  /// [textDirection] must not be null.
+  TextDirection? get textDirection => _textDirection;
+  TextDirection? _textDirection;
+  set textDirection(TextDirection? value) {
+    if (_textDirection != value) {
+      _textDirection = value;
+      markNeedsLayout();
+    }
+  }
+
+  /// Determines the order in which runs are laid out. When [direction] is [Axis.vertical], this corresponds to the literal vertical direction, while if it's [Axis.horizontal], well, it'll determine the horizontal direction. It actually controls the order of the runs. Maybe I should rename it to `multilineDirection` or something.
+  ///
+  /// (the following was copied from flutter Wrap, it's written insanely but afaik it's true.)
+  ///
+  /// If the [direction] is [Axis.vertical], this controls which order children
+  /// are painted in (down or up), the meaning of the [alignment] property's
+  /// [WrapAlignment.start] and [WrapAlignment.end] values.
+  ///
+  /// If the [direction] is [Axis.vertical], and either the [alignment]
+  /// is either [WrapAlignment.start] or [WrapAlignment.end], or there's
+  /// more than one child, then the [verticalDirection] must not be null.
+  ///
+  /// If the [direction] is [Axis.horizontal], this controls the order in which
+  /// runs are positioned, the meaning of the [runAlignment] property's
+  /// [WrapAlignment.start] and [WrapAlignment.end] values, as well as the
+  /// [crossAxisAlignment] property's [WrapCrossAlignment.start] and
+  /// [WrapCrossAlignment.end] values.
+  ///
+  /// If the [direction] is [Axis.horizontal], and either the
+  /// [runAlignment] is either [WrapAlignment.start] or [WrapAlignment.end], the
+  /// [crossAxisAlignment] is either [WrapCrossAlignment.start] or
+  /// [WrapCrossAlignment.end], or there's more than one child, then the
+  /// [verticalDirection] must not be null.
+  VerticalDirection get verticalDirection => _verticalDirection;
+  VerticalDirection _verticalDirection;
+  set verticalDirection(VerticalDirection value) {
+    if (_verticalDirection != value) {
+      _verticalDirection = value;
+      markNeedsLayout();
+    }
+  }
+
+  /// {@macro flutter.material.Material.clipBehavior}
+  ///
+  /// Defaults to [Clip.none].
+  Clip get clipBehavior => _clipBehavior;
+  Clip _clipBehavior = Clip.none;
+  set clipBehavior(Clip value) {
+    if (value != _clipBehavior) {
+      _clipBehavior = value;
+      markNeedsPaint();
+      markNeedsSemanticsUpdate();
+    }
+  }
+
+  bool get _debugHasNecessaryDirections {
+    if (firstChild != null && lastChild != firstChild) {
+      // i.e. there's more than one child
+      switch (direction) {
+        case Axis.horizontal:
+          assert(textDirection != null,
+              'Horizontal $runtimeType with multiple children has a null textDirection, so the layout order is undefined.');
+        case Axis.vertical:
+          break;
+      }
+    }
+    if (alignment == WrapAlignment.start || alignment == WrapAlignment.end) {
+      switch (direction) {
+        case Axis.horizontal:
+          assert(textDirection != null,
+              'Horizontal $runtimeType with alignment $alignment has a null textDirection, so the alignment cannot be resolved.');
+        case Axis.vertical:
+          break;
+      }
+    }
+    if (runAlignment == WrapAlignment.start ||
+        runAlignment == WrapAlignment.end) {
+      switch (direction) {
+        case Axis.horizontal:
+          break;
+        case Axis.vertical:
+          assert(textDirection != null,
+              'Vertical $runtimeType with runAlignment $runAlignment has a null textDirection, so the alignment cannot be resolved.');
+      }
+    }
+    if (crossAxisAlignment == WrapCrossAlignment.start ||
+        crossAxisAlignment == WrapCrossAlignment.end) {
+      switch (direction) {
+        case Axis.horizontal:
+          break;
+        case Axis.vertical:
+          assert(textDirection != null,
+              'Vertical $runtimeType with crossAxisAlignment $crossAxisAlignment has a null textDirection, so the alignment cannot be resolved.');
+      }
+    }
+    return true;
+  }
+
+  final LayerHandle<ClipRectLayer> _clipRectLayer =
+      LayerHandle<ClipRectLayer>();
+
+  @override
+  void setupParentData(RenderBox child) {
+    if (child.parentData is! InsertableWrapParentData) {
+      child.parentData = InsertableWrapParentData();
+    }
+  }
+
+  @override
+  double computeMinIntrinsicWidth(double height) {
+    switch (direction) {
+      case Axis.horizontal:
+        double width = 0.0;
+        RenderBox? child = firstChild;
+        while (child != null) {
+          width = max(width, child.getMinIntrinsicWidth(double.infinity));
+          child = childAfter(child);
+        }
+        return width;
+      case Axis.vertical:
+        return getDryLayout(BoxConstraints(maxHeight: height)).width;
+    }
+  }
+
+  @override
+  double computeMaxIntrinsicWidth(double height) {
+    switch (direction) {
+      case Axis.horizontal:
+        double width = 0.0;
+        RenderBox? child = firstChild;
+        while (child != null) {
+          width += child.getMaxIntrinsicWidth(double.infinity);
+          child = childAfter(child);
+        }
+        return width;
+      case Axis.vertical:
+        return getDryLayout(BoxConstraints(maxHeight: height)).width;
+    }
+  }
+
+  @override
+  double computeMinIntrinsicHeight(double width) {
+    switch (direction) {
+      case Axis.horizontal:
+        return getDryLayout(BoxConstraints(maxWidth: width)).height;
+      case Axis.vertical:
+        double height = 0.0;
+        RenderBox? child = firstChild;
+        while (child != null) {
+          height = max(height, child.getMinIntrinsicHeight(double.infinity));
+          child = childAfter(child);
+        }
+        return height;
+    }
+  }
+
+  @override
+  double computeMaxIntrinsicHeight(double width) {
+    switch (direction) {
+      case Axis.horizontal:
+        return getDryLayout(BoxConstraints(maxWidth: width)).height;
+      case Axis.vertical:
+        double height = 0.0;
+        RenderBox? child = firstChild;
+        while (child != null) {
+          height += child.getMaxIntrinsicHeight(double.infinity);
+          child = childAfter(child);
+        }
+        return height;
+    }
+  }
+
+  @override
+  double? computeDistanceToActualBaseline(TextBaseline baseline) {
+    return defaultComputeDistanceToHighestActualBaseline(baseline);
+  }
+
+  double _getMainAxisExtent(Size childSize) {
+    return switch (direction) {
+      Axis.horizontal => childSize.width,
+      Axis.vertical => childSize.height,
+    };
+  }
+
+  double _getCrossAxisExtent(Size childSize) {
+    return switch (direction) {
+      Axis.horizontal => childSize.height,
+      Axis.vertical => childSize.width,
+    };
+  }
+
+  Offset _getOffset(double mainAxisOffset, double crossAxisOffset) {
+    return switch (direction) {
+      Axis.horizontal => Offset(mainAxisOffset, crossAxisOffset),
+      Axis.vertical => Offset(crossAxisOffset, mainAxisOffset),
+    };
+  }
+
+  @override
+  double? computeDryBaseline(
+      covariant BoxConstraints constraints, TextBaseline baseline) {
+    if (firstChild == null) {
+      return null;
+    }
+    final BoxConstraints childConstraints = switch (direction) {
+      Axis.horizontal => BoxConstraints(maxWidth: constraints.maxWidth),
+      Axis.vertical => BoxConstraints(maxHeight: constraints.maxHeight),
+    };
+
+    final (AxisSize childrenAxisSize, List<_RunMetrics> runMetrics) =
+        _computeRuns(constraints, ChildLayoutHelper.dryLayoutChild);
+    final AxisSize containerAxisSize =
+        childrenAxisSize.applyConstraints(constraints, direction);
+
+    BaselineOffset baselineOffset = BaselineOffset.noBaseline;
+    void findHighestBaseline(Offset offset, RenderBox child) {
+      baselineOffset = baselineOffset.minOf(
+          BaselineOffset(child.getDryBaseline(childConstraints, baseline)) +
+              offset.dy);
+    }
+
+    Size getChildSize(RenderBox child) => child.getDryLayout(childConstraints);
+    _positionChildren(runMetrics, childrenAxisSize, containerAxisSize,
+        findHighestBaseline, getChildSize);
+    return baselineOffset.offset;
+  }
+
+  @override
+  @protected
+  Size computeDryLayout(covariant BoxConstraints constraints) {
+    return _computeDryLayout(constraints);
+  }
+
+  Size _computeDryLayout(BoxConstraints constraints,
+      [ChildLayouter layoutChild = ChildLayoutHelper.dryLayoutChild]) {
+    final (BoxConstraints childConstraints, double mainAxisLimit) =
+        switch (direction) {
+      Axis.horizontal => (
+          BoxConstraints(maxWidth: constraints.maxWidth),
+          constraints.maxWidth
+        ),
+      Axis.vertical => (
+          BoxConstraints(maxHeight: constraints.maxHeight),
+          constraints.maxHeight
+        ),
+    };
+
+    double mainAxisExtent = 0.0;
+    double crossAxisExtent = 0.0;
+    double runMainAxisExtent = 0.0;
+    double runCrossAxisExtent = 0.0;
+    int childCount = 0;
+    RenderBox? child = firstChild;
+    while (child != null) {
+      final Size childSize = layoutChild(child, childConstraints);
+      final double childMainAxisExtent = _getMainAxisExtent(childSize);
+      final double childCrossAxisExtent = _getCrossAxisExtent(childSize);
+      // There must be at least one child before we move on to the next run.
+      if (childCount > 0 &&
+          runMainAxisExtent + childMainAxisExtent + spacing > mainAxisLimit) {
+        mainAxisExtent = max(mainAxisExtent, runMainAxisExtent);
+        crossAxisExtent += runCrossAxisExtent + runSpacing;
+        runMainAxisExtent = 0.0;
+        runCrossAxisExtent = 0.0;
+        childCount = 0;
+      }
+      runMainAxisExtent += childMainAxisExtent;
+      runCrossAxisExtent = max(runCrossAxisExtent, childCrossAxisExtent);
+      if (childCount > 0) {
+        runMainAxisExtent += spacing;
+      }
+      childCount += 1;
+      child = childAfter(child);
+    }
+    crossAxisExtent += runCrossAxisExtent;
+    mainAxisExtent = max(mainAxisExtent, runMainAxisExtent);
+
+    return constraints.constrain(switch (direction) {
+      Axis.horizontal => Size(mainAxisExtent, crossAxisExtent),
+      Axis.vertical => Size(crossAxisExtent, mainAxisExtent),
+    });
+  }
+
+  static Size _getChildSize(RenderBox child) => child.size;
+  static void _setChildPosition(Offset offset, RenderBox child) {
+    (child.parentData! as InsertableWrapParentData).offset = offset;
+  }
+
+  bool _hasVisualOverflow = false;
+
+  @override
+  void performLayout() {
+    final BoxConstraints constraints = this.constraints;
+    previousBoxConstraints = constraints;
+    assert(_debugHasNecessaryDirections);
+    if (firstChild == null) {
+      size = constraints.smallest;
+      _hasVisualOverflow = false;
+      return;
+    }
+
+    final (AxisSize childrenAxisSize, List<_RunMetrics> runMetrics) =
+        _computeRuns(constraints, ChildLayoutHelper.layoutChild);
+    if (previousComputedRuns != null) {
+      //then we're caching these so let's cache this one
+      previousComputedRuns = (childrenAxisSize, runMetrics);
+    }
+
+    final AxisSize containerAxisSize =
+        childrenAxisSize.applyConstraints(constraints, direction);
+    size = containerAxisSize.toSize(direction);
+    final AxisSize freeAxisSize = containerAxisSize - childrenAxisSize;
+    _hasVisualOverflow =
+        freeAxisSize.mainAxisExtent < 0.0 || freeAxisSize.crossAxisExtent < 0.0;
+
+    _positionChildren(runMetrics, freeAxisSize, containerAxisSize,
+        _setChildPosition, _getChildSize);
+  }
+
+  // Look ahead, creates a new run if incorporating the child would exceed the allowed line width.
+  (AxisSize childrenSize, List<_RunMetrics> runMetrics) _computeRuns(
+      BoxConstraints constraints, ChildLayouter layoutChild) {
+    final (BoxConstraints childConstraints, double mainAxisLimit) =
+        switch (direction) {
+      Axis.horizontal => (
+          BoxConstraints(maxWidth: constraints.maxWidth),
+          constraints.maxWidth
+        ),
+      Axis.vertical => (
+          BoxConstraints(maxHeight: constraints.maxHeight),
+          constraints.maxHeight
+        ),
+    };
+
+    final double spacing = this.spacing;
+
+    final List<_RunMetrics> runMetrics = <_RunMetrics>[];
+    _RunMetrics? currentRun;
+    AxisSize childrenAxisSize = AxisSize.empty;
+
+    void completeRun() {
+      childrenAxisSize += currentRun!.axisSize.flipped;
+    }
+
+    void newRun(RenderBox child, AxisSize childSize) {
+      currentRun = _RunMetrics();
+      currentRun!.axisSize = childSize;
+      currentRun!.leadingChild = child;
+      currentRun!.childCount = 1;
+      runMetrics.add(currentRun!);
+    }
+
+    for (RenderBox? child = firstChild;
+        child != null;
+        child = childAfter(child)) {
+      final AxisSize childSize = AxisSize.fromSize(
+          size: layoutChild(child, childConstraints), direction: direction);
+
+      if (currentRun == null) {
+        newRun(child, childSize);
+      } else if (currentRun!.axisSize.mainAxisExtent +
+              childSize.mainAxisExtent +
+              spacing >
+          mainAxisLimit + precisionErrorTolerance) {
+        // if we've exceeded the main axis limit, complete the current run and start a new one
+        completeRun();
+        newRun(child, childSize);
+      } else {
+        currentRun!.axisSize +=
+            childSize + AxisSize(mainAxisExtent: spacing, crossAxisExtent: 0.0);
+        currentRun!.childCount += 1;
+      }
+    }
+    if (currentRun != null) {
+      completeRun();
+    }
+
+    // distribute spacing between runs
+    assert(runMetrics.isNotEmpty);
+    final double totalRunSpacing = runSpacing * (runMetrics.length - 1);
+    childrenAxisSize +=
+        AxisSize(mainAxisExtent: totalRunSpacing, crossAxisExtent: 0.0);
+
+    return (childrenAxisSize.flipped, runMetrics);
+  }
+
+  void _positionChildren(
+      List<_RunMetrics> runMetrics,
+      AxisSize freeAxisSize,
+      AxisSize containerAxisSize,
+      PositionChild positionChild,
+      GetChildSize getChildSize) {
+    assert(runMetrics.isNotEmpty);
+
+    final double spacing = this.spacing;
+
+    final double crossAxisFreeSpace = max(0.0, freeAxisSize.crossAxisExtent);
+
+    final WrapCrossAlignment effectiveCrossAlignment =
+        direction == Axis.horizontal
+            ? crossAxisAlignment
+            : wrapAlignmentFlippsed(crossAxisAlignment);
+
+    final (double runLeadingSpace, double runBetweenSpace) =
+        distributeWrapSpace(
+      runAlignment,
+      crossAxisFreeSpace,
+      runSpacing,
+      runMetrics.length,
+    );
+
+    double runCrossAxisOffset = runLeadingSpace;
+    final Iterable<_RunMetrics> runs = verticalDirection == VerticalDirection.up
+        ? runMetrics.reversed
+        : runMetrics;
+    for (final _RunMetrics run in runs) {
+      final double runCrossAxisExtent = run.axisSize.crossAxisExtent;
+      int childCount = run.childCount;
+
+      final double mainAxisFreeSpace = max(
+          0.0, containerAxisSize.mainAxisExtent - run.axisSize.mainAxisExtent);
+
+      final (double childLeadingSpace, double childBetweenSpace) =
+          distributeWrapSpace(
+              alignment, mainAxisFreeSpace, spacing, childCount);
+
+      double childMainAxisOffset = childLeadingSpace;
+
+      for (RenderBox? child = run.leadingChild;
+          child != null && childCount > 0;
+          child = childAfter(child), childCount -= 1) {
+        final AxisSize(
+          mainAxisExtent: double childMainAxisExtent,
+          crossAxisExtent: double childCrossAxisExtent
+        ) = AxisSize.fromSize(size: getChildSize(child), direction: direction);
+        final double childCrossAxisOffset =
+            wrapCrossAlignmentAlignment(effectiveCrossAlignment) *
+                (runCrossAxisExtent - childCrossAxisExtent);
+        positionChild(
+            _getOffset(
+                childMainAxisOffset, runCrossAxisOffset + childCrossAxisOffset),
+            child);
+        childMainAxisOffset += childMainAxisExtent + childBetweenSpace;
+      }
+      runCrossAxisOffset += runCrossAxisExtent + runBetweenSpace;
+    }
+  }
+
+  @override
+  bool hitTestChildren(BoxHitTestResult result, {required Offset position}) {
+    return defaultHitTestChildren(result, position: position);
+  }
+
+  /// returns the index at which an object being inserted at position p (where p is relative to the top left of the wrap)
+  /// usually used for drag and drop insertion index calculation
+  /// insertionSpacingForClear, used in cases where the insertion indicator should be placed in a clear zone, not right adjacent to a child (eg, if an insertion is to be done after the end of a row, where the row isn't close to the edge of the wrap), is the amount of space to put between the center of the insertion point and the edge of the container or the nearest child.
+  InsertionPoint insertionIndexAt(Offset p,
+      {double insertionSpacingForClear = 20}) {
+    // if not null, then it's updated by performLayout
+    if (previousBoxConstraints == null) {
+      // this would never happen, since it would mean the drag and drop is happening before the container has been laid out, which a user can't do
+      // note, the position isn't quite right, but this might not get used
+      return const InsertionPoint(
+          index: 0,
+          position: Offset.zero,
+          insertingAfter: false,
+          inserterWide: true);
+    }
+
+    // we compute from previous frame's positions
+    previousComputedRuns ??=
+        _computeRuns(previousBoxConstraints!, ChildLayoutHelper.dryLayoutChild);
+    final (AxisSize childrenAxisSize, List<_RunMetrics> runMetrics) =
+        previousComputedRuns!;
+
+    // we generally work with normalized positions where runs go to the right and down, we flip back at the end
+    Offset flipOffset(Offset o) => Offset(o.dy, o.dx);
+    Size flipSize(Size s) => Size(s.height, s.width);
+    // normalized size
+    final Size rsize = direction == Axis.horizontal ? size : flipSize(size);
+    double maybeFlippedAxis(double x, bool flipped, double span) =>
+        flipped ? span - x : x;
+    Offset transform(Offset o) {
+      Offset result = o;
+      result = direction == Axis.horizontal ? result : flipOffset(result);
+      result = Offset(
+          maybeFlippedAxis(
+              result.dx, textDirection == TextDirection.rtl, rsize.width),
+          maybeFlippedAxis(result.dy, verticalDirection == VerticalDirection.up,
+              rsize.height));
+      return result;
+    }
+
+    Offset transformBack(Offset o) {
+      // reverse of normalizeRect for offset
+      Offset result = o;
+      result = Offset(
+          maybeFlippedAxis(
+              result.dx, textDirection == TextDirection.rtl, rsize.width),
+          maybeFlippedAxis(result.dy, verticalDirection == VerticalDirection.up,
+              rsize.height));
+      result = direction == Axis.horizontal ? result : flipOffset(result);
+      return result;
+    }
+
+    // translates a rect representing the position of a child so that it is as if the flow is left to right top to bottom
+    Rect normalizeRect(Rect rect) {
+      Rect r = rect;
+      r = direction == Axis.horizontal
+          ? r
+          : flipOffset(r.topLeft) & flipSize(r.size);
+      r = textDirection == TextDirection.ltr
+          ? r
+          : Offset(size.width - (r.topLeft.dx + r.width), r.topLeft.dy) &
+              r.size;
+      r = verticalDirection == VerticalDirection.down
+          ? r
+          : Offset(r.topLeft.dx, size.height - (r.topLeft.dy + r.height)) &
+              r.size;
+      return r;
+    }
+
+    final Offset pr = transform(p);
+
+    // performance opportunity if needed; you can speed this up by first doing a spine check, where you check the leadingChild of each row to rule most rows out
+    // complications: we don't know which row we're in until we've processed the following row to find its lowest y and see whether it's closer to the insertion point than the prev row's highest y
+    // remember the nearest one from the previous row, check the next row to see if there's anything nearer per the y of that row, if not, it's the one from the previous.
+    if (runMetrics.isEmpty) {
+      return InsertionPoint(
+          index: 0,
+          insertingAfter: false,
+          position: Offset(insertionSpacingForClear, insertionSpacingForClear),
+          inserterWide: true);
+    }
+    int itotal = 0;
+    // whether the cursor should be rendered on one of the ends
+    bool prevNearestIndicatorIsWide = true;
+    // these would seem to be the opposite of their names, this is because the coordinate system flips the y axis
+    double prevRowsLowestY = double.negativeInfinity;
+    double prevRowsHighestY = double.infinity;
+    double prevRowsNearestIndicatorX = 0;
+    bool prevNearestAfter = false;
+    int prevRowsNearestChildIndex = 0;
+    for (int i = 0; i < runMetrics.length; i++) {
+      final _RunMetrics run = runMetrics[i];
+      if (run.childCount == 0) {
+        continue;
+      }
+      double thisRowsLowestY = double.negativeInfinity;
+      double thisRowsHighestY = double.infinity;
+      // (nearest in x, nearest from the edge of the child)
+      double nearestChildDistanceX = double.infinity;
+      int nearestChildIndex = 0;
+      double? nearestIndicatorX;
+      // whether the indicator is right next to the child/between the child and the edge of the widget
+      bool nearestIndicatorIsWide = false;
+      RenderBox? child = run.leadingChild;
+      double? previousChildRightEdge;
+      bool nearestAfter = false;
+      bool nearestIndicatorXNeedsSetting = false;
+      for (int j = 0; j < run.childCount; j++) {
+        if (child == null) {
+          break;
+        }
+        final Rect childBounds = normalizeRect(
+            (child.parentData as InsertableWrapParentData).offset & child.size);
+        if (childBounds.bottom > thisRowsLowestY) {
+          thisRowsLowestY = childBounds.bottom;
+        }
+        if (childBounds.top < thisRowsHighestY) {
+          thisRowsHighestY = childBounds.top;
+        }
+        if (nearestIndicatorXNeedsSetting) {
+          nearestIndicatorX = (previousChildRightEdge! + childBounds.left) / 2;
+          nearestIndicatorXNeedsSetting = false;
+        }
+        bool insertingAfter = pr.dx > childBounds.center.dx;
+        bool isInside = pr.dx >= childBounds.left && pr.dx < childBounds.right;
+        // check nearness to each side of the child
+        double leftDistance = (childBounds.left - pr.dx).abs();
+        // when there's no gap between two items, they have the same edge, in this case we make sure the point is considered to be closer to the edge belonging to the item that it's inside
+        if (leftDistance < nearestChildDistanceX ||
+            (isInside && leftDistance <= nearestChildDistanceX)) {
+          nearestChildIndex = itotal;
+          nearestAfter = insertingAfter;
+          nearestChildDistanceX = leftDistance;
+          if (previousChildRightEdge != null) {
+            nearestIndicatorIsWide = false;
+            nearestIndicatorX = childBounds.left - insertionSpacingForClear;
+          } else {
+            nearestIndicatorIsWide = true;
+            nearestIndicatorX = previousChildRightEdge == null
+                ? childBounds.left
+                : (previousChildRightEdge + childBounds.left) / 2;
+          }
+        }
+        double rightDistance = (childBounds.right - pr.dx).abs();
+        if (rightDistance < nearestChildDistanceX) {
+          nearestChildIndex = itotal;
+          nearestAfter = insertingAfter;
+          nearestChildDistanceX = rightDistance;
+          // we don't know the next child's left, so can't set nearestX, this flag will make sure it's done either way
+          nearestIndicatorXNeedsSetting = true;
+        }
+        itotal += 1;
+        previousChildRightEdge = childBounds.right;
+        child = (child.parentData as InsertableWrapParentData).nextSibling;
+      }
+      if (nearestIndicatorXNeedsSetting) {
+        nearestIndicatorX = previousChildRightEdge! + insertionSpacingForClear;
+      }
+      if (pr.dy > (thisRowsHighestY + prevRowsLowestY) / 2 ||
+          // if prevLowestY is unset like so, it means this is the first row
+          prevRowsLowestY == double.negativeInfinity) {
+        //then it could be in this row
+        if (pr.dy < thisRowsLowestY) {
+          // then it is in this row. Otherwise, continue on to the next row to find out where that boundary is, and then we'll know for sure
+          return InsertionPoint(
+              index: nearestChildIndex,
+              insertingAfter: nearestAfter,
+              position: transformBack(Offset(nearestIndicatorX!,
+                  (thisRowsLowestY + thisRowsHighestY) / 2)),
+              inserterWide: nearestIndicatorIsWide);
+        }
+      } else {
+        //then it's actually in the previous row
+        return InsertionPoint(
+            index: prevRowsNearestChildIndex,
+            insertingAfter: prevNearestAfter,
+            position: transformBack(Offset(prevRowsNearestIndicatorX,
+                (prevRowsLowestY + prevRowsHighestY) / 2)),
+            inserterWide: prevNearestIndicatorIsWide);
+      }
+      prevRowsLowestY = thisRowsLowestY;
+      prevRowsHighestY = thisRowsHighestY;
+      prevRowsNearestIndicatorX = nearestIndicatorX ?? 0;
+      prevRowsNearestChildIndex = nearestChildIndex;
+      prevNearestAfter = nearestAfter;
+      prevNearestIndicatorIsWide = nearestIndicatorIsWide;
+    }
+
+    return InsertionPoint(
+        index: runMetrics.length,
+        insertingAfter: true,
+        position: transformBack(
+            Offset(insertionSpacingForClear, insertionSpacingForClear)),
+        inserterWide: true);
+  }
+
+  void doPaint(PaintingContext context, Offset offset) {
+    _clipRectLayer.layer = null;
+    // Paint each child at its layout position
+    RenderBox? child = firstChild;
+    while (child != null) {
+      final parentData = child.parentData! as InsertableWrapParentData;
+      context.paintChild(child, offset + parentData.offset);
+      child = childAfter(child);
+    }
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    // TODO(ianh): move the debug flex overflow paint logic somewhere common so
+    // it can be reused here
+    if (_hasVisualOverflow && clipBehavior != Clip.none) {
+      _clipRectLayer.layer = context.pushClipRect(
+        needsCompositing,
+        offset,
+        Offset.zero & size,
+        doPaint,
+        clipBehavior: clipBehavior,
+        oldLayer: _clipRectLayer.layer,
+      );
+    } else {
+      doPaint(context, offset);
+    }
+  }
+
+  @override
+  void dispose() {
+    _clipRectLayer.layer = null;
+    super.dispose();
+  }
+
+  @override
+  void debugFillProperties(DiagnosticPropertiesBuilder properties) {
+    super.debugFillProperties(properties);
+    properties.add(EnumProperty<Axis>('direction', direction));
+    properties.add(EnumProperty<WrapAlignment>('alignment', alignment));
+    properties.add(DoubleProperty('spacing', spacing));
+    properties.add(EnumProperty<WrapAlignment>('runAlignment', runAlignment));
+    properties.add(DoubleProperty('runSpacing', runSpacing));
+    properties.add(DoubleProperty('crossAxisAlignment', runSpacing));
+    properties.add(EnumProperty<TextDirection>('textDirection', textDirection,
+        defaultValue: null));
+    properties.add(EnumProperty<VerticalDirection>(
+        'verticalDirection', verticalDirection,
+        defaultValue: VerticalDirection.down));
+  }
+
+  // cached for ~ hit testing during drag and drop: we don't want to be recomputing them every frame unnecessarily
+  // only starts caching (sets this to non-null) when insertionIndexAt is called at least once. ie, usually for drag and drop insertion calculation.
+  // it's, of course, acceptable for the layout info to be a frame out of date for drag and drop, since the user's knowledge of the layout info is also a frame out of date.
+  (AxisSize, List<_RunMetrics>)? previousComputedRuns;
+  // updated in performLayout, used in insertionIndexAt when necessary
+  BoxConstraints? previousBoxConstraints;
+}
+
+wrapAlignmentFlippsed(WrapCrossAlignment v) => switch (v) {
+      WrapCrossAlignment.start => WrapCrossAlignment.end,
+      WrapCrossAlignment.end => WrapCrossAlignment.start,
+      WrapCrossAlignment.center => WrapCrossAlignment.center,
+    };
+
+wrapCrossAlignmentAlignment(WrapCrossAlignment v) => switch (v) {
+      WrapCrossAlignment.start => 0,
+      WrapCrossAlignment.end => 1,
+      WrapCrossAlignment.center => 0.5,
+    };
+
+/// A layout widget that displays its children in multiple horizontal or vertical runs.
+/// A version of the Wrap with a cleaner layout implementation and an 'insertionIndexAt' method for drag and drop insertion.
+class IWrap extends StatelessWidget {
+  /// Creates a wrap layout.
+  const IWrap({
+    super.key,
+    this.direction = Axis.horizontal,
+    this.alignment = WrapAlignment.start,
+    this.spacing = 0.0,
+    this.runAlignment = WrapAlignment.start,
+    this.runSpacing = 0.0,
+    this.crossAxisAlignment = WrapCrossAlignment.start,
+    this.textDirection = TextDirection.ltr,
+    this.verticalDirection = VerticalDirection.down,
+    this.clipBehavior = Clip.none,
+    this.children = const <Widget>[],
+  });
+
+  /// The direction to use as the main axis.
+  final Axis direction;
+
+  /// How the children within a run should be placed in the main axis.
+  final WrapAlignment alignment;
+
+  /// How much space to place between children in a run in the main axis.
+  final double spacing;
+
+  /// How the runs themselves should be placed in the cross axis.
+  final WrapAlignment runAlignment;
+
+  /// How much space to place between the runs themselves in the cross axis.
+  final double runSpacing;
+
+  /// How the children within a run should be aligned relative to each other in
+  /// the cross axis.
+  final WrapCrossAlignment crossAxisAlignment;
+
+  /// Determines the order to lay children out horizontally and how to interpret
+  /// `start` and `end` in the horizontal direction.
+  final TextDirection? textDirection;
+
+  /// Determines the order to lay children out vertically and how to interpret
+  /// `start` and `end` in the vertical direction.
+  final VerticalDirection verticalDirection;
+
+  /// The content will be clipped (or not) according to this option.
+  final Clip clipBehavior;
+
+  /// The widgets below this widget in the tree.
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return _InsertableWrapRenderWidget(
+      direction: direction,
+      alignment: alignment,
+      spacing: spacing,
+      runAlignment: runAlignment,
+      runSpacing: runSpacing,
+      crossAxisAlignment: crossAxisAlignment,
+      textDirection: textDirection,
+      verticalDirection: verticalDirection,
+      clipBehavior: clipBehavior,
+      children: children,
+    );
+  }
+}
+
+class _InsertableWrapRenderWidget extends MultiChildRenderObjectWidget {
+  const _InsertableWrapRenderWidget({
+    required this.direction,
+    required this.alignment,
+    required this.spacing,
+    required this.runAlignment,
+    required this.runSpacing,
+    required this.crossAxisAlignment,
+    required this.textDirection,
+    required this.verticalDirection,
+    required this.clipBehavior,
+    required super.children,
+  });
+
+  final Axis direction;
+  final WrapAlignment alignment;
+  final double spacing;
+  final WrapAlignment runAlignment;
+  final double runSpacing;
+  final WrapCrossAlignment crossAxisAlignment;
+  final TextDirection? textDirection;
+  final VerticalDirection verticalDirection;
+  final Clip clipBehavior;
+
+  @override
+  InsertableWrapRender createRenderObject(BuildContext context) {
+    return InsertableWrapRender(
+      direction: direction,
+      alignment: alignment,
+      spacing: spacing,
+      runAlignment: runAlignment,
+      runSpacing: runSpacing,
+      crossAxisAlignment: crossAxisAlignment,
+      textDirection: textDirection,
+      verticalDirection: verticalDirection,
+      clipBehavior: clipBehavior,
+    );
+  }
+
+  @override
+  void updateRenderObject(
+      BuildContext context, InsertableWrapRender renderObject) {
+    renderObject
+      ..direction = direction
+      ..alignment = alignment
+      ..spacing = spacing
+      ..runAlignment = runAlignment
+      ..runSpacing = runSpacing
+      ..crossAxisAlignment = crossAxisAlignment
+      ..textDirection = textDirection
+      ..verticalDirection = verticalDirection
+      ..clipBehavior = clipBehavior;
+  }
+}
+
+/// gets the insertion point relative to globalOffset, necessary for rearranging order through drag and drop.
+InsertionPoint insertionOf(GlobalKey key, Offset globalOffset) {
+  return (key.currentContext!.findRenderObject() as InsertableWrapRender)
+      .insertionIndexAt((key.currentContext!.findRenderObject() as RenderBox)
+          .globalToLocal(globalOffset));
+}

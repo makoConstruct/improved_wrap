@@ -1,0 +1,20 @@
+name: improved_wrap
+description: "A wrap widget with a cleaner (but equivalent) layout implementation and an 'insertionIndexAt' method for drag and drop insertion."
+version: 1.0.0
+homepage: https://github.com/makoConstruct/improved_wrap
+license: MIT
+
+environment:
+  sdk: ^3.5.4
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
