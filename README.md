@@ -1,4 +1,4 @@
-[![pub package](https://img.shields.io/pub/v/animated_containers.svg)](https://pub.dartlang.org/packages/animated_containers)
+[![pub package](https://img.shields.io/pub/v/improved_wrap.svg)](https://pub.dartlang.org/packages/improved_wrap)
 
 `IWrap` is a wrap widget with a cleaner (but equivalent) layout implementation and an 'insertionIndexAt' method for drag and drop insertion.
 
