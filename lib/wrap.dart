@@ -479,11 +479,18 @@ class InsertableWrapRender extends RenderBox
     };
   }
 
-  Offset _getOffset(double mainAxisOffset, double crossAxisOffset) {
-    return switch (direction) {
-      Axis.horizontal => Offset(mainAxisOffset, crossAxisOffset),
-      Axis.vertical => Offset(crossAxisOffset, mainAxisOffset),
+  Offset _getOffset(double mainAxisOffset, double crossAxisOffset,
+      double fullMainAxisExtent, double childMainAxisExtent) {
+    Offset result = switch (textDirection ?? TextDirection.ltr) {
+      TextDirection.ltr => Offset(mainAxisOffset, crossAxisOffset),
+      TextDirection.rtl => Offset(
+          fullMainAxisExtent - childMainAxisExtent - mainAxisOffset,
+          crossAxisOffset),
     };
+    if (direction == Axis.vertical) {
+      result = flipOffset(result);
+    }
+    return result;
   }
 
   @override
@@ -728,7 +735,10 @@ class InsertableWrapRender extends RenderBox
                 (runCrossAxisExtent - childCrossAxisExtent);
         positionChild(
             _getOffset(
-                childMainAxisOffset, runCrossAxisOffset + childCrossAxisOffset),
+                childMainAxisOffset,
+                runCrossAxisOffset + childCrossAxisOffset,
+                run.axisSize.mainAxisExtent,
+                childMainAxisExtent),
             child);
         childMainAxisOffset += childMainAxisExtent + childBetweenSpace;
       }
@@ -764,8 +774,6 @@ class InsertableWrapRender extends RenderBox
         previousComputedRuns!;
 
     // we generally work with normalized positions where runs go to the right and down, we flip back at the end
-    Offset flipOffset(Offset o) => Offset(o.dy, o.dx);
-    Size flipSize(Size s) => Size(s.height, s.width);
     // normalized size
     final Size rsize = direction == Axis.horizontal ? size : flipSize(size);
     double maybeFlippedAxis(double x, bool flipped, double span) =>
@@ -1137,3 +1145,6 @@ InsertionPoint insertionOf(GlobalKey key, Offset globalOffset) {
       .insertionIndexAt((key.currentContext!.findRenderObject() as RenderBox)
           .globalToLocal(globalOffset));
 }
+
+Offset flipOffset(Offset o) => Offset(o.dy, o.dx);
+Size flipSize(Size s) => Size(s.height, s.width);
