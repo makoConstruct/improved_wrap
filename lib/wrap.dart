@@ -737,7 +737,7 @@ class InsertableWrapRender extends RenderBox
             _getOffset(
                 childMainAxisOffset,
                 runCrossAxisOffset + childCrossAxisOffset,
-                run.axisSize.mainAxisExtent,
+                containerAxisSize.mainAxisExtent,
                 childMainAxisExtent),
             child);
         childMainAxisOffset += childMainAxisExtent + childBetweenSpace;

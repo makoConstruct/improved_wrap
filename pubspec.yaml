@@ -1,6 +1,6 @@
 name: improved_wrap
 description: "A wrap widget with a cleaner (but equivalent) layout implementation and an 'insertionIndexAt' method for drag and drop insertion."
-version: 1.1.0
+version: 1.1.1
 homepage: https://github.com/makoConstruct/improved_wrap
 license: MIT
 
