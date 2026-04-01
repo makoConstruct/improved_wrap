@@ -204,7 +204,6 @@ class _MyHomePageState extends State<MyHomePage> {
                       padding: const EdgeInsets.all(8.0),
                       child: IWrap(
                         spacing: 8,
-                        // movementDuration: const Duration(milliseconds: 280),
                         runSpacing: 8,
                         children: _items.toList(),
                       ),

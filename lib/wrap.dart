@@ -938,7 +938,8 @@ class InsertableWrapRender extends RenderBox
     }
 
     return InsertionPoint(
-        index: runMetrics.length,
+        // after the last child
+        index: max(itotal - 1, 0),
         insertingAfter: true,
         position: transformBack(
             Offset(insertionSpacingForClear, insertionSpacingForClear)),
