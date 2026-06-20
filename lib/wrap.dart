@@ -1,5 +1,3 @@
-library animated_containers;
-
 import 'package:flutter/material.dart';
 
 // mostly copied from flutter's Wrap widget
@@ -16,13 +14,15 @@ import 'util.dart';
     WrapAlignment alignment,
     double freeSpace,
     double itemSpacing,
-    int itemCount) {
+    int itemCount,
+    bool flipped) {
   assert(itemCount > 0);
   return switch (alignment) {
-    WrapAlignment.start => (0.0, itemSpacing),
-    WrapAlignment.end => (freeSpace, itemSpacing),
+    WrapAlignment.start => (flipped ? freeSpace : 0.0, itemSpacing),
+    WrapAlignment.end => distributeWrapSpace(
+        WrapAlignment.start, freeSpace, itemSpacing, itemCount, !flipped),
     WrapAlignment.spaceBetween when itemCount < 2 => distributeWrapSpace(
-        WrapAlignment.start, freeSpace, itemSpacing, itemCount),
+        WrapAlignment.start, freeSpace, itemSpacing, itemCount, flipped),
     WrapAlignment.spaceBetween => (
         0,
         freeSpace / (itemCount - 1) + itemSpacing
@@ -42,7 +42,11 @@ import 'util.dart';
 class _RunMetrics {
   AxisSize axisSize = AxisSize.empty;
   int childCount = 0;
+  // First and last child of the run in tree order. [leadingChild] is always the
+  // first child laid out into the run; positioning starts from [trailingChild]
+  // when the main axis is flipped.
   RenderBox? leadingChild;
+  RenderBox? trailingChild;
 }
 
 /// Parent data for use with [InsertableWrapRender].
@@ -479,19 +483,26 @@ class InsertableWrapRender extends RenderBox
     };
   }
 
-  Offset _getOffset(double mainAxisOffset, double crossAxisOffset,
-      double fullMainAxisExtent, double childMainAxisExtent) {
-    Offset result = switch (textDirection ?? TextDirection.ltr) {
-      TextDirection.ltr => Offset(mainAxisOffset, crossAxisOffset),
-      TextDirection.rtl => Offset(
-          fullMainAxisExtent - childMainAxisExtent - mainAxisOffset,
-          crossAxisOffset),
+  /// Whether the (main, cross) axes run opposite to increasing screen
+  /// coordinates. The horizontal screen axis is always governed by
+  /// [textDirection] and the vertical screen axis by [verticalDirection],
+  /// regardless of [direction]; this getter just maps those onto the main and
+  /// cross axes for the current [direction].
+  (bool flipMainAxis, bool flipCrossAxis) get _areAxesFlipped {
+    final bool flipHorizontal =
+        (textDirection ?? TextDirection.ltr) == TextDirection.rtl;
+    final bool flipVertical = verticalDirection == VerticalDirection.up;
+    return switch (direction) {
+      Axis.horizontal => (flipHorizontal, flipVertical),
+      Axis.vertical => (flipVertical, flipHorizontal),
     };
-    if (direction == Axis.vertical) {
-      result = flipOffset(result);
-    }
-    return result;
   }
+
+  Offset _getOffset(double mainAxisOffset, double crossAxisOffset) =>
+      switch (direction) {
+        Axis.horizontal => Offset(mainAxisOffset, crossAxisOffset),
+        Axis.vertical => Offset(crossAxisOffset, mainAxisOffset),
+      };
 
   @override
   double? computeDryBaseline(
@@ -643,6 +654,7 @@ class InsertableWrapRender extends RenderBox
       currentRun = _RunMetrics();
       currentRun!.axisSize = childSize;
       currentRun!.leadingChild = child;
+      currentRun!.trailingChild = child;
       currentRun!.childCount = 1;
       runMetrics.add(currentRun!);
     }
@@ -666,6 +678,7 @@ class InsertableWrapRender extends RenderBox
         currentRun!.axisSize +=
             childSize + AxisSize(mainAxisExtent: spacing, crossAxisExtent: 0.0);
         currentRun!.childCount += 1;
+        currentRun!.trailingChild = child;
       }
     }
     if (currentRun != null) {
@@ -693,10 +706,10 @@ class InsertableWrapRender extends RenderBox
 
     final double crossAxisFreeSpace = max(0.0, freeAxisSize.crossAxisExtent);
 
-    final WrapCrossAlignment effectiveCrossAlignment =
-        direction == Axis.horizontal
-            ? crossAxisAlignment
-            : wrapAlignmentFlippsed(crossAxisAlignment);
+    final (bool flipMainAxis, bool flipCrossAxis) = _areAxesFlipped;
+    final WrapCrossAlignment effectiveCrossAlignment = flipCrossAxis
+        ? wrapAlignmentFlippsed(crossAxisAlignment)
+        : crossAxisAlignment;
 
     final (double runLeadingSpace, double runBetweenSpace) =
         distributeWrapSpace(
@@ -704,12 +717,12 @@ class InsertableWrapRender extends RenderBox
       crossAxisFreeSpace,
       runSpacing,
       runMetrics.length,
+      flipCrossAxis,
     );
 
     double runCrossAxisOffset = runLeadingSpace;
-    final Iterable<_RunMetrics> runs = verticalDirection == VerticalDirection.up
-        ? runMetrics.reversed
-        : runMetrics;
+    final Iterable<_RunMetrics> runs =
+        flipCrossAxis ? runMetrics.reversed : runMetrics;
     for (final _RunMetrics run in runs) {
       final double runCrossAxisExtent = run.axisSize.crossAxisExtent;
       int childCount = run.childCount;
@@ -719,13 +732,14 @@ class InsertableWrapRender extends RenderBox
 
       final (double childLeadingSpace, double childBetweenSpace) =
           distributeWrapSpace(
-              alignment, mainAxisFreeSpace, spacing, childCount);
+              alignment, mainAxisFreeSpace, spacing, childCount, flipMainAxis);
 
       double childMainAxisOffset = childLeadingSpace;
 
-      for (RenderBox? child = run.leadingChild;
+      for (RenderBox? child = flipMainAxis ? run.trailingChild : run.leadingChild;
           child != null && childCount > 0;
-          child = childAfter(child), childCount -= 1) {
+          child = flipMainAxis ? childBefore(child) : childAfter(child),
+          childCount -= 1) {
         final AxisSize(
           mainAxisExtent: double childMainAxisExtent,
           crossAxisExtent: double childCrossAxisExtent
@@ -734,11 +748,8 @@ class InsertableWrapRender extends RenderBox
             wrapCrossAlignmentAlignment(effectiveCrossAlignment) *
                 (runCrossAxisExtent - childCrossAxisExtent);
         positionChild(
-            _getOffset(
-                childMainAxisOffset,
-                runCrossAxisOffset + childCrossAxisOffset,
-                containerAxisSize.mainAxisExtent,
-                childMainAxisExtent),
+            _getOffset(childMainAxisOffset,
+                runCrossAxisOffset + childCrossAxisOffset),
             child);
         childMainAxisOffset += childMainAxisExtent + childBetweenSpace;
       }
@@ -774,18 +785,19 @@ class InsertableWrapRender extends RenderBox
         previousComputedRuns!;
 
     // we generally work with normalized positions where runs go to the right and down, we flip back at the end
-    // normalized size
+    // normalized size: width is the main axis extent, height is the cross axis extent
     final Size rsize = direction == Axis.horizontal ? size : flipSize(size);
+    // In the normalized frame the main axis is x and the cross axis is y, so the
+    // main axis is flipped by flipMainAxis and the cross axis by flipCrossAxis.
+    final (bool flipMainAxis, bool flipCrossAxis) = _areAxesFlipped;
     double maybeFlippedAxis(double x, bool flipped, double span) =>
         flipped ? span - x : x;
     Offset transform(Offset o) {
       Offset result = o;
       result = direction == Axis.horizontal ? result : flipOffset(result);
       result = Offset(
-          maybeFlippedAxis(
-              result.dx, textDirection == TextDirection.rtl, rsize.width),
-          maybeFlippedAxis(result.dy, verticalDirection == VerticalDirection.up,
-              rsize.height));
+          maybeFlippedAxis(result.dx, flipMainAxis, rsize.width),
+          maybeFlippedAxis(result.dy, flipCrossAxis, rsize.height));
       return result;
     }
 
@@ -793,10 +805,8 @@ class InsertableWrapRender extends RenderBox
       // reverse of normalizeRect for offset
       Offset result = o;
       result = Offset(
-          maybeFlippedAxis(
-              result.dx, textDirection == TextDirection.rtl, rsize.width),
-          maybeFlippedAxis(result.dy, verticalDirection == VerticalDirection.up,
-              rsize.height));
+          maybeFlippedAxis(result.dx, flipMainAxis, rsize.width),
+          maybeFlippedAxis(result.dy, flipCrossAxis, rsize.height));
       result = direction == Axis.horizontal ? result : flipOffset(result);
       return result;
     }
@@ -807,13 +817,13 @@ class InsertableWrapRender extends RenderBox
       r = direction == Axis.horizontal
           ? r
           : flipOffset(r.topLeft) & flipSize(r.size);
-      r = textDirection == TextDirection.ltr
+      r = !flipMainAxis
           ? r
-          : Offset(size.width - (r.topLeft.dx + r.width), r.topLeft.dy) &
+          : Offset(rsize.width - (r.topLeft.dx + r.width), r.topLeft.dy) &
               r.size;
-      r = verticalDirection == VerticalDirection.down
+      r = !flipCrossAxis
           ? r
-          : Offset(r.topLeft.dx, size.height - (r.topLeft.dy + r.height)) &
+          : Offset(r.topLeft.dx, rsize.height - (r.topLeft.dy + r.height)) &
               r.size;
       return r;
     }
@@ -989,7 +999,8 @@ class InsertableWrapRender extends RenderBox
     properties.add(DoubleProperty('spacing', spacing));
     properties.add(EnumProperty<WrapAlignment>('runAlignment', runAlignment));
     properties.add(DoubleProperty('runSpacing', runSpacing));
-    properties.add(DoubleProperty('crossAxisAlignment', runSpacing));
+    properties.add(EnumProperty<WrapCrossAlignment>(
+        'crossAxisAlignment', crossAxisAlignment));
     properties.add(EnumProperty<TextDirection>('textDirection', textDirection,
         defaultValue: null));
     properties.add(EnumProperty<VerticalDirection>(

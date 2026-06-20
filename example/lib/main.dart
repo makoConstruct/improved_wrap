@@ -17,7 +17,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AnimatedWrap Demo',
+      title: 'Improved Wrap Demo',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
             seedColor: const Color.fromARGB(255, 34, 34, 34)),
@@ -173,7 +173,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('animated wrap'),
+        title: const Text('improved wrap'),
       ),
       body: KeyboardListener(
         focusNode: _focusNode,

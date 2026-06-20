@@ -1,5 +1,5 @@
 [![pub package](https://img.shields.io/pub/v/improved_wrap.svg)](https://pub.dartlang.org/packages/improved_wrap)
 
-`IWrap` is a wrap widget with a cleaner (but equivalent) layout implementation and an 'insertionIndexAt' method for drag and drop insertion.
+`IWrap` is a wrap widget with a cleaner (but equivalent) layout implementation and an 'InsertionPoint insertionIndexAt(Offset relativePosition)' kind of method, where InsertionPoint tells you how relativePosition relates to the nearest items in the wrap, roughly speaking, you need this kind of information for drag and drop insertion.
 
 (IWrap was forked out from [animated_containers](https://github.com/makoConstruct/animated_containers) after mako discovered animated_to, reflected on it, and decided that yeah the container shouldn't be the part that handles animation, so let's retain the improvements we made to Wrap but with the animation stuff stripped out)
